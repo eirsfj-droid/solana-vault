@@ -1,62 +1,61 @@
-# Simple Vault — Практика Anchor (Неделя 9)
+# Simple Vault — Практика Anchor (Неделя 10)
 
-Учебный смарт-контракт на базе Anchor 0.31.1 (Solana). Реализован функционал депозита базовых токенов с чеканкой долевых токенов (share-токенов) через межпрограммные вызовы (CPI).
+Учебный смарт-контракт на базе Anchor 0.31.1 (Solana). Реализован полный цикл управления активами: создание хранилища, карточки пользователей, депозит и вывод активов (withdraw) со сжиганием долевых токенов через межпрограммные вызовы (CPI).
 
 ---
 
 ## Что делает контракт
 
-1. **Инициализация хранилища (`initialize_vault`)** — создание `VaultState` PDA, токен-аккаунта `vault_token_account` и минта долей `share_mint`. *(Неделя 8)*
-2. **Персональная карточка (`create_user_card`)** — создание уникального PDA пользователя `UserCard` внутри хранилища. *(Неделя 8)*
-3. **Депозит токенов (`deposit`)** — перевод базовых токенов в хранилище и выпуск share-токенов через CPI. *(Неделя 9)*
+1. **`initialize_vault`** — инициализирует хранилище `VaultState`, токен-аккаунт `vault_token_account` и минт долей `share_mint`. *(Неделя 8)*
+2. **`create_user_card`** — регистрирует уникальную карточку пользователя `UserCard` PDA. *(Неделя 8)*
+3. **`deposit(amount)`** — принимает токены от пользователя и чеканит ему share-токены (1:1 при первом депозите, пропорционально далее). *(Неделя 9)*
+4. **`withdraw(shares_amount)`** — принимает share-токены обратно, сжигает их и возвращает базовые токены пользователю. *(Неделя 10)*
 
 ---
 
-## Архитектура PDA и сиды
+## Вывод из хранилища (Withdraw) — Неделя 10
 
-* **Vault State PDA**: `[b"vault", token_mint]` — детерминированный адрес хранилища для выбранного SPL-токена.
-* **Vault Token Account**: `[b"vault_tokens", token_mint]` — токен-аккаунт для хранения заблокированных активов под контролем PDA.
-* **Share Mint**: `[b"share_mint", token_mint]` — минт share-токенов, где полномочиями на минт (mint authority) обладает `vault_state` PDA.
-* **User Card PDA**: `[b"user_card", vault_state, user]` — персональный реестр пользователя, гарантирующий ровно одну карточку на пару (vault, user).
+Инструкция `withdraw(shares_amount)` позволяет пользователю погасить свои share-токены и забрать причитающуюся ему долю базовых активов из хранилища.
 
----
+### Формула расчёта возвращаемых токенов
 
-## Депозит и выпуск share-токенов (Неделя 9)
+Количество токенов к возврату рассчитывается строго пропорционально доле сжигаемых shares от общего пула:
 
-Инструкция `deposit(amount)` принимает токены от пользователя и начисляет ему соответствующую долю пула в виде share-токенов.
+$$tokens\_out = shares\_amount \times \frac{total\_tokens}{total\_shares}$$
 
-> **Важно:** Депозит возможен исключительно после создания карточки `create_user_card`. Без неё транзакция завершается ошибкой.
+* Если за время нахождения средств в хранилище баланс $total\_tokens$ увеличился (прибыль от стратегий или торговые комиссии), пользователь получает больше токенов, чем изначально вносил — зафиксировав свою доходность.
+* Если $shares\_amount = card.shares$, пользователь полностью выходит из позиции.
 
-### Математическая модель долей
+### Последовательность выполнения и CPI
 
-Расчёт количества выпускаемых shares производится по формуле:
+Вывод средств выполняется строго атомарно в 4 этапа:
 
-1. **Первый депозит** ($total\_shares = 0$ или $total\_tokens = 0$):
-   $$shares = amount \quad (1:1)$$
-2. **Последующие депозиты**:
-   $$shares = amount \times \frac{total\_shares}{total\_tokens}$$
+1. **Проверка условий и расчет суммы:**
+   * Проверяется ненулевой размер вывода (`shares_amount > 0`).
+   * Проверяется наличие долей в хранилище (`total_shares > 0`).
+   * Рассчитывается `tokens_out` с защитой от переполнения (`MathOverflow`) и проверка `tokens_out > 0` (`WithdrawTooSmall`).
 
-### Почему поздний вкладчик получает меньше shares при наличии прибыли?
+2. **CPI: Сжигание долей (`token::burn`):**
+   * Пользователь сам является владельцем своего аккаунта долей (`user_share_account`).
+   * Смарт-контракт инициирует вызов `token::burn` от имени пользователя:
+     ```rust
+     token::burn(
+         CpiContext::new(
+             ctx.accounts.token_program.to_account_info(),
+             Burn {
+                 mint: ctx.accounts.share_mint.to_account_info(),
+                 from: ctx.accounts.user_share_account.to_account_info(),
+                 authority: ctx.accounts.user.to_account_info(),
+             },
+         ),
+         shares_amount,
+     )?;
+     ```
+   * Если у пользователя недостаточно shares на балансе, SPL Token Program вернет ошибку и транзакция будет отменена.
 
-Реальная внутренняя стоимость одной доли определяется как:
-$$\text{Share Value} = \frac{total\_tokens}{total\_shares}$$
-
-* Когда хранилище работает и получает доход (например, yield от стратегий или комиссии AMM), пул активов $total\_tokens$ растет, тогда как количество выпущенных долей $total\_shares$ остается прежним.
-* В результате стоимость одной доли превышает 1.0 ($\text{Share Value} > 1$).
-* При новом депозите на сумму $amount$ знаменатель формулы ($total\_tokens$) больше числителя ($total\_shares$), поэтому вкладчик получает **меньше shares**, чем номинальная сумма внесенных токенов.
-* Этот механизм математически защищает ранних инвесторов от размытия их прибыли и гарантирует, что новый участник выкупает справедливую текущую долю в выросшем капитале пула.
-
-### Межпрограммные вызовы (CPI)
-
-В процессе депозита выполняются два CPI-вызова к SPL Token Program:
-
-1. **`token::transfer` (Депозит токенов):**
-   * Пользователь переводит базовые токены со своего аккаунта `user_token_account` на адрес `vault_token_account`.
-   * Вызов подписывается приватным ключом самого пользователя (`authority: user`).
-
-2. **`token::mint_to` (Чеканка долей):**
-   * Владельцем минта `share_mint` является `vault_state` PDA (у которого нет приватного ключа).
-   * Вызов осуществляется через `CpiContext::new_with_signer` с использованием сидов хранилища:
+3. **CPI: Перевод токенов пользователю (`token::transfer`):**
+   * Токены хранятся на аккаунте `vault_token_account`, владельцем которого является `vault_state` PDA.
+   * Контракт переводит `tokens_out` пользователю с подписью сидами хранилища через `CpiContext::new_with_signer`:
      ```rust
      let token_mint_key = ctx.accounts.vault_state.token_mint;
      let seeds = &[
@@ -66,22 +65,45 @@ $$\text{Share Value} = \frac{total\_tokens}{total\_shares}$$
      ];
      let signer = &[&seeds[..]];
 
-     token::mint_to(
+     token::transfer(
          CpiContext::new_with_signer(
              ctx.accounts.token_program.to_account_info(),
-             MintTo {
-                 mint: ctx.accounts.share_mint.to_account_info(),
-                 to: ctx.accounts.user_share_account.to_account_info(),
+             Transfer {
+                 from: ctx.accounts.vault_token_account.to_account_info(),
+                 to: ctx.accounts.user_token_account.to_account_info(),
                  authority: ctx.accounts.vault_state.to_account_info(),
              },
              signer,
          ),
-         shares,
+         tokens_out,
      )?;
      ```
-   * Рантайм Solana подтверждает право PDA на чеканку на основании переданных сидов.
 
-После успешных CPI обновляются показатели `total_tokens` и `total_shares` в `VaultState`, а также счетчики `deposited` и `shares` в карточке `UserCard`.
+4. **Обновление состояния аккаунтов:**
+   * В `VaultState` уменьшаются `total_tokens` (на `tokens_out`) и `total_shares` (на `shares_amount`).
+   * В карточке `UserCard` уменьшаются `deposited` (на `tokens_out`) и `shares` (на `shares_amount`).
+
+---
+
+## Что такое Inner Instructions в Solana Explorer?
+
+В блокчейне Solana транзакция состоит из одного или нескольких внешних инструкций верхнего уровня (**Top-Level Instructions**), явно сформированных клиентом.
+
+Когда смарт-контракт во время исполнения инструкции делает **CPI (Cross-Program Invocation)** в другую программу (например, в SPL Token Program), рантайм Solana выполняет этот дочерний вызов в том же контексте транзакции и протоколирует его как **Inner Instruction** (внутреннюю инструкцию).
+
+### Как это выглядит в Solana Explorer:
+При вызове `withdraw` транзакция отображается в виде иерархического дерева:
+
+```
+#1 SimpleVault: withdraw
+  ├── #1.1 SPL Token: Burn (сжигание shares_amount токенов на user_share_account)
+  └── #1.2 SPL Token: Transfer (перевод tokens_out с vault_token_account на user_token_account)
+```
+
+### Ключевые свойства Inner Instructions:
+1. **Атомарность:** Все внутренние инструкции выполняются в рамках одной транзакции. Если любая внутренняя инструкция упадет (например, ошибка баланса в `Burn` или `Transfer`), откатывается вся транзакция целиком.
+2. **Прозрачность аудита:** В Solana Explorer на вкладке транзакции блок «Instruction Processed» наглядно показывает последовательность CPI-вызовов, задействованные программы и изменение балансов всех счетов.
+3. **RPC-ответ:** В JSON-RPC вызове `getTransaction` внутренние инструкции возвращаются в специальном массиве `meta.innerInstructions`, привязанном к индексу корневой инструкции.
 
 ---
 
@@ -91,11 +113,13 @@ $$\text{Share Value} = \frac{total\_tokens}{total\_shares}$$
 yarn test
 ```
 
-Сценарии:
+Сценарии тестов 10-й недели:
 * `initialize_vault: vault создан`
 * `create_user_card: у каждого пользователя своя карточка`
-* `create_user_card: повторная карточка — ошибка`
 * `deposit: A вносит 100 токенов → получает 100 shares`
 * `deposit: B вносит 50 токенов → получает 50 shares`
-* `deposit: без карточки — ошибка`
-* `deposit: сумма 0 — ошибка`
+* `withdraw: A возвращает 50 shares → получает 50 токенов`
+* `withdraw: B выводит всё → shares сожжены, токены возвращены`
+* `withdraw: сумма 0 — ошибка`
+* `withdraw: больше своих shares — ошибка`
+* `withdraw: без карточки — ошибка`
