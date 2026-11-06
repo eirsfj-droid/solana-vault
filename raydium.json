@@ -1,0 +1,32 @@
+{
+  "network": "devnet",
+  "programId": "DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH",
+  "poolId": "7ZVMVG2fa1chZVqGDuiofgqq6R5puZJJNGgjFd4EkXpu",
+  "ammConfig": {
+    "index": 0,
+    "feeRate": 2500,
+    "tickSpacing": 60,
+    "protocolFeeRate": 1200
+  },
+  "tokenA": {
+    "mint": "4T9jq581kFSNE4aAtgzsAAVAy6Cfvq9M4dkBtahD4JSa",
+    "name": "MyToken",
+    "symbol": "MTK",
+    "decimals": 6
+  },
+  "tokenB": {
+    "mint": "So11111111111111111111111111111111111111112",
+    "name": "Wrapped SOL",
+    "symbol": "wSOL",
+    "decimals": 9
+  },
+  "parameters": {
+    "currentPrice": 0.005,
+    "sqrtPriceX64": "13043817825332782",
+    "tickSpacing": 60,
+    "tickCurrent": -52980,
+    "rangePercent": 0.10,
+    "tickLower": -54000,
+    "tickUpper": -51960
+  }
+}

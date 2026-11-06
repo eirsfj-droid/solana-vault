@@ -1,6 +1,9 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Burn, Mint, MintTo, Token, TokenAccount, Transfer};
 
+pub mod instructions;
+use instructions::*;
+
 declare_id!("EbojNUfh9Jk6dyZaaQAJWofbdnkvdxfQbeAPq6iWoHAu");
 
 #[program]
@@ -29,6 +32,8 @@ pub mod simple_vault {
         let card = &mut ctx.accounts.user_card;
         card.vault = ctx.accounts.vault_state.key();
         card.owner = ctx.accounts.user.key();
+        card.deposited = 0;
+        card.shares = 0;
         card.bump = ctx.bumps.user_card;
 
         msg!("User card created for: {}", card.owner);
@@ -45,7 +50,7 @@ pub mod simple_vault {
 
         let vault = &ctx.accounts.vault_state;
 
-        // Сколько shares получит пользователь
+        // Сколько shares положено пользователю
         let shares = if vault.total_shares == 0 || vault.total_tokens == 0 {
             amount // первый депозит: 1 share = 1 token
         } else {
@@ -57,7 +62,7 @@ pub mod simple_vault {
         };
         require!(shares > 0, VaultError::SharesTooSmall);
 
-        // 1. Переводим токены: пользователь → vault
+        // 1. Перевод токенов: пользователь → vault
         token::transfer(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -70,7 +75,7 @@ pub mod simple_vault {
             amount,
         )?;
 
-        // 2. Печатаем shares пользователю (подписывает vault PDA)
+        // 2. Чеканим shares пользователю (подписывает vault PDA)
         let token_mint_key = ctx.accounts.vault_state.token_mint;
         let seeds = &[
             b"vault".as_ref(),
@@ -117,7 +122,7 @@ pub mod simple_vault {
         let vault = &ctx.accounts.vault_state;
         require!(vault.total_shares > 0, VaultError::VaultEmpty);
 
-        // Сколько токенов положено за эти shares
+        // Сколько токенов вернуть за эти shares
         let tokens_out = (shares_amount as u128)
             .checked_mul(vault.total_tokens as u128)
             .and_then(|v| v.checked_div(vault.total_shares as u128))
@@ -125,7 +130,7 @@ pub mod simple_vault {
             .ok_or(VaultError::MathOverflow)?;
         require!(tokens_out > 0, VaultError::WithdrawTooSmall);
 
-        // 1. Сжигаем shares пользователя (подписывает сам пользователь)
+        // 1. CPI: сжигаем shares пользователя (подписывает сам пользователь)
         token::burn(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -138,7 +143,7 @@ pub mod simple_vault {
             shares_amount,
         )?;
 
-        // 2. Отправляем токены: vault → пользователь (подписывает vault PDA)
+        // 2. CPI: переводим токены из vault_token_account пользователю (подписывает vault PDA)
         let token_mint_key = ctx.accounts.vault_state.token_mint;
         let seeds = &[
             b"vault".as_ref(),
@@ -160,21 +165,53 @@ pub mod simple_vault {
             tokens_out,
         )?;
 
-        // 3. Обновляем vault и карточку пользователя
+        // 3. Обновляем vault и карточку
         let vault = &mut ctx.accounts.vault_state;
         vault.total_tokens = vault.total_tokens.checked_sub(tokens_out).ok_or(VaultError::MathOverflow)?;
         vault.total_shares = vault.total_shares.checked_sub(shares_amount).ok_or(VaultError::MathOverflow)?;
 
-        // saturating: shares можно передать другому кошельку, тогда в карточке их может быть меньше
         let card = &mut ctx.accounts.user_card;
         card.deposited = card.deposited.saturating_sub(tokens_out);
-        card.shares = card.shares.saturating_sub(shares_amount);
+        card.shares = card.shares.checked_sub(shares_amount).ok_or(VaultError::MathOverflow)?;
 
         msg!(
             "Withdraw: {} shares -> {} tokens (total_tokens={}, total_shares={})",
             shares_amount, tokens_out, vault.total_tokens, vault.total_shares
         );
         Ok(())
+    }
+
+    /// Открыть позицию в Raydium CLMM через CPI.
+    /// Vault PDA выступает position_nft_owner (владелец позиции).
+    pub fn open_raydium_position<'a, 'b, 'c: 'info, 'info>(
+        ctx: Context<'a, 'b, 'c, 'info, OpenRaydiumPosition<'info>>,
+        tick_lower_index: i32,
+        tick_upper_index: i32,
+        tick_array_lower_start_index: i32,
+        tick_array_upper_start_index: i32,
+        liquidity: u128,
+        amount_0_max: u64,
+        amount_1_max: u64,
+    ) -> Result<()> {
+        instructions::open_position::handler(
+            ctx,
+            tick_lower_index,
+            tick_upper_index,
+            tick_array_lower_start_index,
+            tick_array_upper_start_index,
+            liquidity,
+            amount_0_max,
+            amount_1_max,
+        )
+    }
+
+    /// Закрыть позицию в Raydium CLMM через CPI.
+    pub fn close_raydium_position<'a, 'b, 'c: 'info, 'info>(
+        ctx: Context<'a, 'b, 'c, 'info, CloseRaydiumPosition<'info>>,
+        amount_0_min: u64,
+        amount_1_min: u64,
+    ) -> Result<()> {
+        instructions::close_position::handler(ctx, amount_0_min, amount_1_min)
     }
 }
 
@@ -184,7 +221,6 @@ pub mod simple_vault {
 
 #[derive(Accounts)]
 pub struct InitializeVault<'info> {
-    /// VaultState PDA — seeds: ["vault", token_mint]
     #[account(
         init,
         payer = admin,
@@ -194,7 +230,6 @@ pub struct InitializeVault<'info> {
     )]
     pub vault_state: Account<'info, VaultState>,
 
-    /// Token account, принадлежащий vault PDA
     #[account(
         init,
         payer = admin,
@@ -205,7 +240,6 @@ pub struct InitializeVault<'info> {
     )]
     pub vault_token_account: Account<'info, TokenAccount>,
 
-    /// Mint для shares — выпускается vault PDA
     #[account(
         init,
         payer = admin,
@@ -216,7 +250,6 @@ pub struct InitializeVault<'info> {
     )]
     pub share_mint: Account<'info, Mint>,
 
-    /// SPL-токен, который принимает vault
     pub token_mint: Account<'info, Mint>,
 
     #[account(mut)]
@@ -235,7 +268,6 @@ pub struct CreateUserCard<'info> {
     )]
     pub vault_state: Account<'info, VaultState>,
 
-    /// UserCard PDA — seeds: ["user_card", vault_state, user]
     #[account(
         init,
         payer = user,
@@ -260,7 +292,6 @@ pub struct Deposit<'info> {
     )]
     pub vault_state: Account<'info, VaultState>,
 
-    /// Карточка пользователя — депозит возможен только после create_user_card
     #[account(
         mut,
         seeds = [b"user_card", vault_state.key().as_ref(), user.key().as_ref()],
@@ -268,7 +299,6 @@ pub struct Deposit<'info> {
     )]
     pub user_card: Account<'info, UserCard>,
 
-    /// Токен-аккаунт vault — принимает токены
     #[account(
         mut,
         seeds = [b"vault_tokens", vault_state.token_mint.as_ref()],
@@ -278,7 +308,6 @@ pub struct Deposit<'info> {
     )]
     pub vault_token_account: Account<'info, TokenAccount>,
 
-    /// Share mint — vault печатает shares
     #[account(
         mut,
         seeds = [b"share_mint", vault_state.token_mint.as_ref()],
@@ -287,7 +316,6 @@ pub struct Deposit<'info> {
     )]
     pub share_mint: Account<'info, Mint>,
 
-    /// Токен-аккаунт пользователя (откуда списываем токены)
     #[account(
         mut,
         token::mint = vault_state.token_mint,
@@ -295,7 +323,6 @@ pub struct Deposit<'info> {
     )]
     pub user_token_account: Account<'info, TokenAccount>,
 
-    /// Share-аккаунт пользователя (куда придут shares)
     #[account(
         mut,
         token::mint = share_mint,
@@ -318,7 +345,6 @@ pub struct Withdraw<'info> {
     )]
     pub vault_state: Account<'info, VaultState>,
 
-    /// Карточка пользователя — вывод возможен только с карточкой
     #[account(
         mut,
         seeds = [b"user_card", vault_state.key().as_ref(), user.key().as_ref()],
@@ -326,7 +352,6 @@ pub struct Withdraw<'info> {
     )]
     pub user_card: Account<'info, UserCard>,
 
-    /// Токен-аккаунт vault — отправляет токены пользователю
     #[account(
         mut,
         seeds = [b"vault_tokens", vault_state.token_mint.as_ref()],
@@ -336,7 +361,6 @@ pub struct Withdraw<'info> {
     )]
     pub vault_token_account: Account<'info, TokenAccount>,
 
-    /// Share mint — тут сжигаются shares
     #[account(
         mut,
         seeds = [b"share_mint", vault_state.token_mint.as_ref()],
@@ -345,7 +369,6 @@ pub struct Withdraw<'info> {
     )]
     pub share_mint: Account<'info, Mint>,
 
-    /// Токен-аккаунт пользователя (куда придут токены)
     #[account(
         mut,
         token::mint = vault_state.token_mint,
@@ -353,7 +376,6 @@ pub struct Withdraw<'info> {
     )]
     pub user_token_account: Account<'info, TokenAccount>,
 
-    /// Share-аккаунт пользователя (откуда сжигаем shares)
     #[account(
         mut,
         token::mint = share_mint,
@@ -375,11 +397,11 @@ pub struct Withdraw<'info> {
 #[derive(Default)]
 pub struct VaultState {
     pub admin: Pubkey,               // 32
-    pub token_mint: Pubkey,          // 32 — SPL-токен vault'а
-    pub vault_token_account: Pubkey, // 32 — PDA для токенов
-    pub share_mint: Pubkey,          // 32 — mint для shares
-    pub total_tokens: u64,           // 8  — всего токенов в vault
-    pub total_shares: u64,           // 8  — всего выпущено shares
+    pub token_mint: Pubkey,          // 32
+    pub vault_token_account: Pubkey, // 32
+    pub share_mint: Pubkey,          // 32
+    pub total_tokens: u64,           // 8
+    pub total_shares: u64,           // 8
     pub bump: u8,                    // 1
 }
 
@@ -387,15 +409,14 @@ impl VaultState {
     pub const LEN: usize = 8 + 32 + 32 + 32 + 32 + 8 + 8 + 1;
 }
 
-/// Карточка пользователя в vault.
 #[account]
 #[derive(Default)]
 pub struct UserCard {
-    pub vault: Pubkey, // 32 — к какому vault относится
-    pub owner: Pubkey, // 32 — владелец карточки
-    pub deposited: u64, // 8 — сколько токенов внёс пользователь
-    pub shares: u64,    // 8 — сколько shares у пользователя
-    pub bump: u8,      // 1
+    pub vault: Pubkey,  // 32
+    pub owner: Pubkey,  // 32
+    pub deposited: u64, // 8
+    pub shares: u64,    // 8
+    pub bump: u8,       // 1
 }
 
 impl UserCard {
@@ -418,4 +439,8 @@ pub enum VaultError {
     WithdrawTooSmall,
     #[msg("Math overflow")]
     MathOverflow,
+    #[msg("Unauthorized: only admin can perform this operation")]
+    Unauthorized,
+    #[msg("tick_lower must be less than tick_upper")]
+    InvalidTickRange,
 }
