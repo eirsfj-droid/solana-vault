@@ -41,18 +41,13 @@ pub mod simple_vault {
     }
 
     /// Пользователь вносит `amount` токенов → получает share-токены.
-    ///
-    /// Формула:
-    ///   Первый депозит:       shares = amount  (1:1)
-    ///   Последующие депозиты: shares = amount * total_shares / total_tokens
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         require!(amount > 0, VaultError::ZeroAmount);
 
         let vault = &ctx.accounts.vault_state;
 
-        // Сколько shares положено пользователю
         let shares = if vault.total_shares == 0 || vault.total_tokens == 0 {
-            amount // первый депозит: 1 share = 1 token
+            amount
         } else {
             (amount as u128)
                 .checked_mul(vault.total_shares as u128)
@@ -97,7 +92,7 @@ pub mod simple_vault {
             shares,
         )?;
 
-        // 3. Обновляем vault и карточку пользователя
+        // 3. Обновляем vault и карточку
         let vault = &mut ctx.accounts.vault_state;
         vault.total_tokens = vault.total_tokens.checked_add(amount).ok_or(VaultError::MathOverflow)?;
         vault.total_shares = vault.total_shares.checked_add(shares).ok_or(VaultError::MathOverflow)?;
@@ -114,15 +109,12 @@ pub mod simple_vault {
     }
 
     /// Пользователь возвращает `shares_amount` share-токенов → забирает свои токены.
-    ///
-    /// Формула: tokens = shares * total_tokens / total_shares
     pub fn withdraw(ctx: Context<Withdraw>, shares_amount: u64) -> Result<()> {
         require!(shares_amount > 0, VaultError::ZeroAmount);
 
         let vault = &ctx.accounts.vault_state;
         require!(vault.total_shares > 0, VaultError::VaultEmpty);
 
-        // Сколько токенов вернуть за эти shares
         let tokens_out = (shares_amount as u128)
             .checked_mul(vault.total_tokens as u128)
             .and_then(|v| v.checked_div(vault.total_shares as u128))
@@ -130,7 +122,7 @@ pub mod simple_vault {
             .ok_or(VaultError::MathOverflow)?;
         require!(tokens_out > 0, VaultError::WithdrawTooSmall);
 
-        // 1. CPI: сжигаем shares пользователя (подписывает сам пользователь)
+        // 1. CPI: сжигаем shares пользователя
         token::burn(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -143,7 +135,7 @@ pub mod simple_vault {
             shares_amount,
         )?;
 
-        // 2. CPI: переводим токены из vault_token_account пользователю (подписывает vault PDA)
+        // 2. CPI: переводим токены из vault_token_account пользователю
         let token_mint_key = ctx.accounts.vault_state.token_mint;
         let seeds = &[
             b"vault".as_ref(),
@@ -182,7 +174,6 @@ pub mod simple_vault {
     }
 
     /// Открыть позицию в Raydium CLMM через CPI.
-    /// Vault PDA выступает position_nft_owner (владелец позиции).
     pub fn open_raydium_position<'a, 'b, 'c: 'info, 'info>(
         ctx: Context<'a, 'b, 'c, 'info, OpenRaydiumPosition<'info>>,
         tick_lower_index: i32,
@@ -212,6 +203,23 @@ pub mod simple_vault {
         amount_1_min: u64,
     ) -> Result<()> {
         instructions::close_position::handler(ctx, amount_0_min, amount_1_min)
+    }
+
+    /// Инициализировать аккаунт стратегии хранилища (Неделя 12).
+    /// Seeds: [b"strategy", vault_state.key()]
+    pub fn initialize_strategy(ctx: Context<InitializeStrategy>) -> Result<()> {
+        instructions::swap::initialize_strategy_handler(ctx)
+    }
+
+    /// Выполнить обмен токенов через Raydium CLMM via CPI (Неделя 12).
+    /// Включает slippage control через other_amount_threshold: min_amount_out.
+    pub fn swap_tokens<'a, 'b, 'c: 'info, 'info>(
+        ctx: Context<'a, 'b, 'c, 'info, SwapTokens<'info>>,
+        amount_in: u64,
+        min_amount_out: u64,
+        sqrt_price_limit_x64: u128,
+    ) -> Result<()> {
+        instructions::swap::swap_handler(ctx, amount_in, min_amount_out, sqrt_price_limit_x64)
     }
 }
 
@@ -443,4 +451,10 @@ pub enum VaultError {
     Unauthorized,
     #[msg("tick_lower must be less than tick_upper")]
     InvalidTickRange,
+    #[msg("Invalid pool for configured strategy")]
+    InvalidPool,
+    #[msg("Invalid token mint for strategy")]
+    InvalidTokenMint,
+    #[msg("Exceeded slippage tolerance")]
+    ExceededSlippage,
 }
